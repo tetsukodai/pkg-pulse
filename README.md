@@ -1,5 +1,6 @@
 # pkg-pulse
 
+[![AIDE](https://img.shields.io/badge/AIDE-intent--driven-0D9488?style=flat&logo=markdown&logoColor=white)](https://github.com/aidemd-mcp/server)
 [![Node.js](https://img.shields.io/badge/node-%3E%3D22-brightgreen)](https://nodejs.org/)
 [![TypeScript](https://img.shields.io/badge/TypeScript-5.7-blue)](https://www.typescriptlang.org/)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
@@ -23,7 +24,7 @@
 
 ```bash
 # Install globally
-npm install -g @tetsukodai/pkg-pulse
+npm install -g @tetsukod.ai/pkg-pulse
 
 # Run against any npm package
 pkg-pulse zod
@@ -34,7 +35,7 @@ pkg-pulse request
 Or run without installing:
 
 ```bash
-npx @tetsukodai/pkg-pulse zod
+npx @tetsukod.ai/pkg-pulse zod
 ```
 
 For development without building:
@@ -62,14 +63,14 @@ Without a token, GitHub-dependent signals are skipped and the confidence percent
 
 pkg-pulse evaluates packages across six weighted categories:
 
-| Category | Weight | What it measures |
-|---|---|---|
-| **Maintenance** | 30% | Publish recency, commit activity, bus factor, maintainer count, deprecation status |
-| **Security** | 25% | Known CVEs via OSV, severity distribution, deprecated dependency vulnerabilities |
-| **Supply Chain Risk** | 15% | Install scripts, publisher consistency, provenance (Sigstore), maintainer changes |
-| **License** | 10% | License type classification (permissive, copyleft, restrictive, unknown) |
-| **Community** | 10% | Weekly downloads, download trend, GitHub stars |
-| **Quality** | 10% | README presence, TypeScript types (bundled or DefinitelyTyped), test indicators |
+| Category              | Weight | What it measures                                                                   |
+| --------------------- | ------ | ---------------------------------------------------------------------------------- |
+| **Maintenance**       | 30%    | Publish recency, commit activity, bus factor, maintainer count, deprecation status |
+| **Security**          | 25%    | Known CVEs via OSV, severity distribution, deprecated dependency vulnerabilities   |
+| **Supply Chain Risk** | 15%    | Install scripts, publisher consistency, provenance (Sigstore), maintainer changes  |
+| **License**           | 10%    | License type classification (permissive, copyleft, restrictive, unknown)           |
+| **Community**         | 10%    | Weekly downloads, download trend, GitHub stars                                     |
+| **Quality**           | 10%    | README presence, TypeScript types (bundled or DefinitelyTyped), test indicators    |
 
 The **Overall Health Score** is a weighted sum of all categories, reported on a 0–100 scale.
 
@@ -116,18 +117,18 @@ Data sources: npm registry, GitHub API (authenticated), OSV
 
 ## Configuration
 
-| Environment Variable | Required | Description |
-|---|---|---|
-| `GITHUB_TOKEN` | No | GitHub personal access token. Enables commit activity, contributor count, star count, and repo metadata. Without it, these signals are skipped and confidence drops accordingly. |
+| Environment Variable | Required | Description                                                                                                                                                                      |
+| -------------------- | -------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `GITHUB_TOKEN`       | No       | GitHub personal access token. Enables commit activity, contributor count, star count, and repo metadata. Without it, these signals are skipped and confidence drops accordingly. |
 
 ## Exit Codes
 
-| Code | Meaning |
-|---|---|
-| `0` | Success — score computed and printed |
-| `1` | Package not found on npm |
-| `2` | Network failure — could not reach required data sources |
-| `3` | Invalid package name |
+| Code | Meaning                                                 |
+| ---- | ------------------------------------------------------- |
+| `0`  | Success — score computed and printed                    |
+| `1`  | Package not found on npm                                |
+| `2`  | Network failure — could not reach required data sources |
+| `3`  | Invalid package name                                    |
 
 ## Development
 
