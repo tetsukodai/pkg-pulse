@@ -1,0 +1,215 @@
+---
+scope: "."
+description: CLI tool that scores npm package health by aggregating public signals from the npm registry, GitHub API, and optionally OpenSSF Scorecard into a terminal report
+intent: >
+  pkg-pulse gives a developer a single command — a package name — and returns a
+  comprehensive health assessment that captures the real risk of depending on that
+  package. The score and its breakdown must reflect what an experienced engineer
+  would check during a thorough dependency review: maintenance activity and bus
+  factor, security posture including supply chain risk, dependency health (direct
+  deps only for v1), publish recency, deprecation status, licensing, and community
+  trends. The tool succeeds when a developer can look at the output and make an
+  informed adopt-or-avoid decision without opening any browser tabs. It works
+  without authentication for a degraded-but-useful result, and with a GitHub token
+  for full signal coverage.
+outcomes:
+  desired:
+    - Running the CLI with a valid package name produces a numeric health score and a per-signal breakdown printed to the terminal
+    - "The report covers at minimum these signal categories: maintenance cadence, bus factor, known vulnerabilities, supply chain risk (install scripts, maintainer changes, publish anomalies), direct dependency health (including deprecated transitive deps), publish recency, deprecation status, license risk, and download trend"
+    - "All data is fetched from public sources (npm registry API, GitHub API, optionally OpenSSF Scorecard API) — no authentication is required for a basic result, but GITHUB_TOKEN is the recommended path for full signal coverage and practical rate limits"
+    - "The score distinguishes meaningfully between a well-maintained package and an abandoned-but-popular one — popularity alone does not produce a healthy score, and download trend matters more than raw count"
+    - "When data sources are partially unavailable (no GitHub repo, rate-limited, no Scorecard entry), the score normalizes to available signals and each unavailable signal is explicitly labeled in the output with a confidence indicator"
+    - "The tool exits with a non-zero code when the package is not found or data sources are unreachable, with a clear error message"
+  undesired:
+    - "A package with zero commits in two years, open critical CVEs, and a deprecated tag scores above the midpoint because it has high weekly downloads — popularity masks rot"
+    - "Missing or unreachable data sources are silently ignored, producing a confident-looking score built on incomplete signals with no indication of what was skipped"
+    - "The score is a single opaque number with no breakdown, giving the user no way to understand which signals drove the result"
+    - "The tool refuses to run without a GitHub token — instead, it should degrade gracefully with a clear warning about reduced signal coverage"
+    - "The scoring formula is hardcoded with no signal weighting rationale, so adding or adjusting signals later requires rewriting the engine"
+    - "A package that is not deprecated itself but depends on deprecated packages gets a clean deprecation score — inherited risk from direct dependencies must be surfaced"
+    - "Dependency analysis recursively walks the full transitive tree, making scoring slow and API-intensive — v1 scopes to direct dependencies and their immediate health only"
+---
+
+## Context
+
+Developers evaluating whether to adopt an npm dependency currently piece together health signals by hand — checking the npm page for publish recency, opening the GitHub repo to gauge commit activity and contributor count, searching for known CVEs, reading the license, and scanning for deprecation warnings. This process takes five to fifteen minutes per package, is easy to do incompletely, and produces no artifact a team can review or automate against. The problem compounds with scale: a project with dozens of dependencies has no practical way to audit them all without dedicated tooling.
+
+The npm ecosystem makes this harder than it should be. 61% of npm packages have had no release in the last 12 months (npms.io/npm ecosystem analysis), yet many of those are still actively downloaded because they are transitive dependencies of popular frameworks. High download counts create a false sense of health — a package can be downloaded millions of times per week while its sole maintainer has stopped responding to issues and critical CVEs sit unpatched. This is the central tension pkg-pulse must resolve: distinguishing genuine health from popularity inertia.
+
+Three public data sources provide enough signal to make this assessment without requiring package installation or paid services: the npm registry API (metadata, versions, downloads, deprecation, license, install scripts, maintainer list), the GitHub REST API (commit activity, contributor stats, community profile, archived status), and the OSV vulnerability database (known CVEs by package and version). An optional fourth source, the OpenSSF Scorecard API, provides a pre-computed security posture score for GitHub repos at zero auth cost. The constraint is rate limits: GitHub allows only 60 unauthenticated requests per hour per IP, which caps a no-auth session at roughly 12-20 package checks per hour. A GitHub personal access token raises this to 5,000 requests per hour, making it the recommended but not required path.
+
+## Strategy
+
+**Score architecture: weighted category model, not a single regression.** Use six scoring dimensions — Maintenance (30%), Security (25%), Supply Chain Risk (15%), License (10%), Community (10%), Quality (10%) — each scored independently on a 0-100 scale, then combined into a weighted aggregate. This structure directly serves the desired outcome that the report must show a per-signal breakdown, not an opaque number. The weights reflect an opinionated stance grounded in industry consensus: maintenance and security together account for 55% because they represent the two vectors that most directly endanger consumers (npms.io weights maintenance at 35%; OpenSSF Scorecard risk-weights Maintained and Vulnerabilities as High; pkgwatch allocates 25% to maintainer health and 15% to security). Popularity/community is capped at 10% to enforce the undesired-outcome guard that download count alone must never produce a healthy score.
+
+**Maintenance scoring: recency plus bus factor plus deprecation, with a "finished project" exception.** Score days-since-last-publish on a decay curve: 0-90 days = 100, 91-180 = 75, 181-365 = 50, 366-730 = 25, 730+ = 0 (thresholds from health-signals-comprehensive research, aligned with the industry norm that 61% of packages have no release in 12 months). Layer in bus factor computed as the minimum number of contributors responsible for 50% of commits (from GitHub contributors stats endpoint); bus factor of 1 = single point of failure penalty, 2-3 = acceptable, 4+ = full marks. If the GitHub repo is archived, score maintenance as zero regardless of other signals. Apply npms.io's "finished project" heuristic: a package at version 1.0+, not deprecated, fewer than 15 open issues, with a README and tests present, receives a maintenance floor of 90 even if it has not published recently — this prevents penalizing intentionally complete libraries like is-number or sprintf-js.
+
+**Security scoring: current-version CVEs weighted by severity plus dependency CVE exposure.** Query the OSV API for the package's latest published version (not all versions — historical CVEs on old versions are irrelevant if the latest is clean). Weight findings: any CRITICAL = security score 0; HIGH = steep per-finding penalty; MODERATE = moderate penalty; LOW = minor penalty (severity weights from OSV database_specific.severity field). Then batch-query OSV for all direct dependencies to surface inherited vulnerability risk — a package is only as secure as the dependencies it pulls in. This addresses the undesired outcome that a non-deprecated package depending on vulnerable packages should not get a clean security score.
+
+**Supply chain risk: install scripts, maintainer changes, publish anomalies, provenance.** This category has no single API — it is derived from npm packument analysis. Flag install scripts (preinstall, install, postinstall) as a risk signal, escalated to high risk if the scripts were absent in the previous version and appeared in the current one (the characteristic hijack pattern per Socket.dev methodology). Detect maintainer changes by comparing the _npmUser field across recent versions; a new publisher appearing alongside a major change is a supply chain red flag (the pattern behind ua-parser-js, event-stream, and similar attacks). Flag publish frequency anomalies where a historically slow-publishing package suddenly emits multiple versions in a short window. Check for provenance/Sigstore attestation via the dist.npm-signature field — absence is a weak negative signal, not an alarm. These signals are additive: each flag lowers the supply chain score proportionally.
+
+**License scoring: SPDX classification into risk tiers.** Map the npm license field to a five-tier risk model: permissive (MIT, ISC, BSD, Apache-2.0) = 100; weak copyleft (LGPL, MPL-2.0) = 70; strong copyleft (GPL) = 40; network copyleft (AGPL, SSPL) = 20; missing or UNLICENSED = 0 (tiers from license-risk research, aligned with Linux Foundation best practices). Normalize non-standard strings to canonical SPDX using a lookup map (e.g., "Apache 2.0" to "Apache-2.0", "GPLv3" to "GPL-3.0-only"). For compound SPDX expressions, OR operators take the least restrictive license; AND operators take the most restrictive. Cross-reference npm's license field against GitHub's community profile license to flag mismatches.
+
+**Community scoring: trend over count, capped contribution to total.** Compute download trend as the ratio of last-week downloads to last-month downloads normalized per week — a positive delta means growth, negative means decline. Weight the trend more heavily than the raw download count because a declining-but-popular package is in worse health than a growing-but-niche one (directly addresses the desired outcome that "download trend matters more than raw count"). Include GitHub stars and contributor diversity as secondary signals. The 10% category weight ensures that even a package with millions of downloads and thousands of stars cannot compensate for a zero in maintenance or security.
+
+**Quality scoring: documentation and type safety indicators.** Check for README presence and non-trivial length (packument readme field, threshold > 100 characters), TypeScript type declarations (types or typings field in version object, or existence of @types/ companion package), test script presence (scripts.test not equal to the npm default "echo error"), and GitHub community health percentage. These are positive signals that indicate professional maintenance practices.
+
+**Dependency health: direct dependencies only, scoped to count and deprecation.** Count direct runtime dependencies from the latest version's dependencies object. Score on a curve: 0-5 deps = 100, 6-15 = 75, 16-30 = 50, 30+ = 25 (thresholds from health-signals-comprehensive). Check each direct dependency's packument for the deprecated field; any deprecated direct dependency triggers a penalty and a named warning in the output. Do not walk transitive dependencies — average npm depth is 4+ levels, and recursive resolution would make scoring slow and API-intensive (the spec explicitly scopes v1 to direct dependencies). Fold dependency signals into the Security category's dependency sub-score rather than creating a seventh top-level dimension, keeping the breakdown clean at six categories.
+
+**Normalization for missing signals: re-weight to available data, never score absent signals as zero.** When a package has no GitHub repo URL (or it points to a non-GitHub host), all GitHub-sourced signals return null. When the OSV API is unreachable, security signals return null. In either case, re-compute the aggregate by dividing by the sum of weights for signals that actually returned data, not the full weight budget. This prevents penalizing packages hosted on GitLab or Bitbucket and prevents a transient API failure from cratering the score. Every null signal must appear in the output as "unavailable" with the reason (no repo URL, rate limited, API timeout) so the user knows the score's basis — this directly enforces the undesired outcome that missing data must never be silently ignored.
+
+**Confidence indicator: signal coverage percentage.** Display alongside the aggregate score the percentage of total weight that was backed by actual data. A score of 78/100 at 60% signal coverage tells a different story than 78/100 at 100% coverage. This gives the user the information to decide whether to trust the score or run again with a GitHub token for fuller coverage.
+
+**API call strategy: packument first, then fan out in parallel.** Fetch the npm packument first because it provides the version number (needed for OSV), the GitHub repo URL (needed for all GitHub calls), and the direct dependency list (needed for deprecated-dep checks). Once the packument resolves, fan out: OSV query, GitHub repo endpoint, GitHub community profile, GitHub commit activity, GitHub contributors stats, and npm download point queries (last-week and last-month) can all run concurrently. Deprecated-dependency lookups (one packument fetch per direct dep) also run in parallel. This yields 4-5 API calls minimum (no GitHub) or 8-10 calls for a full check, with wall-clock time of 1-2 seconds under good parallelism. The OpenSSF Scorecard API is an optional additional call, gated on a flag or always attempted with graceful degradation.
+
+**GitHub token handling: functional without, recommended with.** Read GITHUB_TOKEN from the environment. If absent, proceed with unauthenticated GitHub calls (60/hour limit) and emit a visible warning that signal coverage is reduced and rate limits are tight. If present, use Bearer auth for 5,000 requests/hour. Never refuse to run without a token — the tool must degrade gracefully, not gate on auth. This is an explicit undesired-outcome guard.
+
+**Error isolation: each signal fails independently.** A timeout on the GitHub stats endpoint must not prevent the npm and OSV signals from scoring. Each signal category captures its own error state. The aggregate score computes over whatever succeeded. Only a 404 on the npm packument (package not found) is a hard failure that exits non-zero with no partial output.
+
+**Exit codes: 0 for success, 1 for not found, 2 for total network failure, 3 for invalid name.** Validate the package name against npm naming rules before any API call. Scoped packages must be URL-encoded for the registry endpoint. Invalid names fail fast with a clear message.
+
+**Monorepo detection: flag, don't skip.** If the packument's repository field includes a directory subpath, note in the output that GitHub metrics represent the entire monorepo, not this package alone. Still use the GitHub signals — they are useful context even if not package-specific.
+
+## Good examples
+
+**Healthy, well-maintained package:**
+
+```
+pkg-pulse: zod@3.23.8
+
+Overall Health Score: 91/100  (100% signal coverage)
+
+Maintenance    █████████░  88/100  Last publish: 32 days ago · Bus factor: 4 · 3 maintainers
+Security       ██████████  100/100 No known CVEs in current version or direct deps
+Supply Chain   █████████░  92/100  No install scripts · Consistent publisher · Sigstore provenance
+License        ██████████  100/100 MIT (permissive)
+Community      █████████░  85/100  2.1M weekly downloads · +6% trend · 34k stars
+Quality        ██████████  95/100  README present · TypeScript types bundled · Tests present
+
+Data sources: npm registry, GitHub API (authenticated), OSV
+```
+
+**Abandoned-but-popular package (the "popularity masks rot" case correctly handled):**
+
+```
+pkg-pulse: request@2.88.2
+
+Overall Health Score: 18/100  (100% signal coverage)
+
+Maintenance    ░░░░░░░░░░   0/100  DEPRECATED: "Use other HTTP libraries" · Last publish: 1,842 days ago
+Security       ██░░░░░░░░  22/100  3 HIGH severity CVEs (GHSA-p8p7-x288-28g6, GHSA-hwc5-pg9j-f2gx, GHSA-jr22-86mf-mmr6)
+Supply Chain   █████░░░░░  55/100  No install scripts · No provenance (pre-Sigstore era)
+License        ██████████  100/100 Apache-2.0 (permissive)
+Community      ████████░░  75/100  14M weekly downloads · -3% trend · 25.6k stars
+Quality        ████████░░  80/100  README present · TypeScript types via @types/request
+
+Warnings:
+  ✕ Package is deprecated: "Use other HTTP libraries"
+  ✕ 3 unpatched HIGH severity vulnerabilities in current version
+  ✕ No commits in last 52 weeks · Repo archived
+
+Data sources: npm registry, GitHub API (authenticated), OSV
+```
+
+**Package with partial signal coverage (no GitHub token):**
+
+```
+pkg-pulse: @private-org/utils@1.4.0
+
+Overall Health Score: 72/100  (45% signal coverage)
+
+Maintenance    ████████░░  76/100  Last publish: 64 days ago · 2 maintainers
+Security       ██████████  100/100 No known CVEs
+Supply Chain   ███████░░░  70/100  postinstall script present
+License        ██████████  100/100 MIT (permissive)
+Community      ████░░░░░░  40/100  340 weekly downloads · +12% trend
+Quality        █████████░  85/100  README present · TypeScript types bundled
+
+Unavailable signals:
+  — GitHub repo metrics: repository field points to private GitLab instance
+  — Bus factor: requires GitHub contributor stats
+  — Commit activity: requires GitHub stats endpoint
+
+⚠ Score based on 45% of total signal weight. Run with GITHUB_TOKEN for fuller coverage.
+
+Data sources: npm registry, OSV
+```
+
+## Bad examples
+
+**Popularity masking rot — the primary anti-pattern.** A report that gives an abandoned, vulnerable package a passing score because downloads are high:
+
+```
+pkg-pulse: request@2.88.2
+
+Overall Health Score: 68/100
+
+Community      ██████████  95/100  14M weekly downloads, 25.6k stars
+Maintenance    ████░░░░░░  40/100  Last publish: 1,842 days ago
+Security       ███████░░░  65/100  Some advisories found
+...
+```
+
+This is wrong because it gives Community a 95 and lets the 10M+ weekly downloads pull the aggregate to 68 — well above a midpoint — despite the package being deprecated with unpatched critical CVEs. The score should be below 25. The root failure is either over-weighting popularity or not making deprecation and critical CVEs into override signals.
+
+**Silent omission of missing data — confident score from incomplete signals:**
+
+```
+pkg-pulse: some-package@2.0.0
+
+Overall Health Score: 85/100
+
+Maintenance    █████████░  90/100  Last publish: 12 days ago
+License        ██████████  100/100 MIT
+Quality        ████████░░  80/100  README present
+```
+
+This looks healthy but quietly dropped Security, Supply Chain, and Community because the GitHub API was rate-limited and the OSV call timed out. No mention of unavailable signals, no confidence indicator, no warning. The user trusts an 85 that is actually based on 35% of signal weight. Every missing signal must be listed with its reason.
+
+**Opaque score with no breakdown:**
+
+```
+pkg-pulse: express@4.18.2
+
+Health Score: 82
+
+No issues found.
+```
+
+This violates the core requirement that the report must show a per-signal breakdown. A single number with no category scores gives the user no way to understand what drove the result or what specific risks exist.
+
+**Deprecated dependency not surfaced:**
+
+```
+pkg-pulse: my-framework@3.1.0
+
+Overall Health Score: 88/100
+
+Maintenance    █████████░  90/100  Last publish: 8 days ago · 4 maintainers
+Security       ██████████  100/100 No known CVEs
+Dependencies   █████████░  88/100  12 direct deps
+...
+```
+
+The package itself is healthy, but three of its twelve direct dependencies are deprecated. The dependency score should reflect this inherited risk, and the warnings section should name each deprecated dependency. Reporting "12 direct deps" without checking their status hides real risk from the user.
+
+**Refusing to run without GitHub token:**
+
+```
+$ pkg-pulse express
+Error: GITHUB_TOKEN environment variable is required. Set it to a GitHub personal access token.
+```
+
+This violates the graceful degradation requirement. The tool must produce a result from npm and OSV data alone, with a warning about reduced coverage — never a hard gate on authentication.
+
+## References
+
+- `research/npm-package-health/index.md` -- Key numbers table: 60 req/hr GitHub unauth limit, 61% of npm packages with no release in 12 months, 4-5 minimum API calls per check, data source URL inventory
+- `research/npm-package-health/npm-registry-api.md` -- Packument response shape (time object for publish recency, maintainers array for bus factor, deprecated field, hasInstallScript, repository URL patterns for GitHub extraction, scripts object for install script detection)
+- `research/npm-package-health/github-api.md` -- Rate limit tiers (60 unauth vs 5,000 auth), repo endpoint fields (archived, pushed_at, open_issues_count), stats/commit_activity and stats/contributors for bus factor computation, 202 retry pattern for cached stats
+- `research/npm-package-health/security-vulnerability-apis.md` -- OSV API request/response shape, querybatch endpoint for dependency CVE checking, severity mapping (CRITICAL/HIGH/MODERATE/LOW weights), supply chain signal derivation from npm metadata (install scripts, maintainer changes, provenance), OpenSSF Scorecard free API endpoint
+- `research/npm-package-health/scoring-methodologies.md` -- npms.io formula (quality 30% / maintenance 35% / popularity 35%) and normalization approach (Bezier curve), finished-project exception heuristic (v1.0+, <15 issues, not deprecated = maintenance floor 0.9), pkgwatch bus factor formula (min contributors for 50% commits), Socket.dev five-dimension model as supply chain methodology reference, industry consensus on healthy thresholds
+- `research/npm-package-health/health-signals-comprehensive.md` -- Full signal catalog with thresholds per category (days-since-publish decay curve, direct dependency count tiers, download trend computation formula, contributor/bus-factor thresholds), minimum vs full API call counts, data-source-to-signal mapping table
+- `research/npm-package-health/production-concerns.md` -- Error isolation pattern (signal-level independent failure), score normalization formula for missing signals (divide by available weight sum), parallel fetch dependency chain (packument first then fan out), exit code recommendations, monorepo detection via repository.directory field, scoped package URL encoding
+- `research/npm-package-health/license-risk.md` -- Five-tier SPDX risk classification with scores per tier, normalization map for non-standard license strings, compound expression handling (OR = least restrictive, AND = most restrictive), cross-reference strategy between npm and GitHub license fields
+- `research/npm-package-health/spec-gap-flags.md` -- Eight gap flags that informed spec body coverage: supply chain as distinct category, bus factor as explicit signal, deprecated direct deps as inherited risk, GitHub token degradation model, score normalization for unavailable signals, OpenSSF Scorecard as optional source, download trend vs raw count, transitive dep scope limited to direct for v1

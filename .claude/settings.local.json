@@ -1,0 +1,9 @@
+{
+  "permissions": {
+    "allow": [
+      "mcp__aide__aide_init",
+      "mcp__aide__aide_discover",
+      "mcp__aide__aide_scaffold"
+    ]
+  }
+}

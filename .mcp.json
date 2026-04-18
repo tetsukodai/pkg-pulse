@@ -1,0 +1,21 @@
+{
+  "mcpServers": {
+    "aide": {
+      "command": "cmd",
+      "args": [
+        "/c",
+        "npx",
+        "@aidemd-mcp/server"
+      ]
+    },
+    "obsidian": {
+      "command": "cmd",
+      "args": [
+        "/c",
+        "npx",
+        "@bitbonsai/mcpvault",
+        "D:\\Code\\Me\\my-brain"
+      ]
+    }
+  }
+}

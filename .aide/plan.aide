@@ -1,0 +1,140 @@
+---
+intent: >
+  Implement pkg-pulse from scaffolding to a working `npx pkg-pulse <package-name>`
+  CLI that fetches npm registry, GitHub API, and OSV data, scores package health
+  across six weighted categories, and renders a terminal report with per-signal
+  breakdown and confidence indicator.
+---
+
+## Plan
+
+### 1. Project scaffolding — TypeScript, Node 22, Vitest, bin entry
+
+Read: `coding-playbook/foundations/conventions`, `coding-playbook/workflow/testing`, `coding-playbook/workflow/config-environment`
+
+- [ ] Initialize the project: `package.json` with `name: "pkg-pulse"`, `type: "module"`, `bin: { "pkg-pulse": "./dist/bin.js" }`, engines `>=22`, and scripts (`build`, `dev`, `test:unit`, `lint`)
+- [ ] Create `tsconfig.json`: target `ES2022`, module `NodeNext`, moduleResolution `NodeNext`, `outDir: "./dist"`, `rootDir: "./src"`, strict, `baseUrl: "."`, paths `@/*` -> `./src/*`. No `noEmit` — this compiles to JS for the bin entry
+- [ ] Create `vitest.config.ts`: environment `node`, include `src/**/*.test.ts`, path alias `@/` -> `./src`
+- [ ] Install dev dependencies: `typescript`, `vitest`, `@types/node`. No runtime dependencies yet — all data fetching uses Node 22 native `fetch`
+- [ ] Create the folder skeleton (empty `index.ts` files as placeholders): `src/bin/index.ts` (CLI entry), `src/score/index.ts` (scoring engine orchestrator), `src/fetch/index.ts` (data-fetching layer orchestrator), `src/types/index.ts` (shared types), `src/render/index.ts` (terminal output)
+
+### 2. Type definitions — domain types for all layers
+
+Read: `coding-playbook/workflow/type-system`, `coding-playbook/architecture/data-flow`
+
+- [ ] In `src/types/index.ts`, define and export all shared types. Key types:
+  - `PackageHealth` — the top-level result: `{ name, version, score, confidence, categories: Record<CategoryName, CategoryScore>, warnings: Warning[], dataSources: string[], unavailableSignals: UnavailableSignal[] }`
+  - `CategoryName` — string literal union: `"maintenance" | "security" | "supplyChain" | "license" | "community" | "quality"`
+  - `CategoryScore` — `{ name: CategoryName, score: number, weight: number, label: string, details: string[] }`
+  - `Warning` — `{ severity: "info" | "warning" | "critical", message: string }`
+  - `UnavailableSignal` — `{ signal: string, reason: string }`
+  - `NpmPackument` — shape of the npm registry packument response (relevant fields only: `name`, `dist-tags`, `time`, `maintainers`, `license`, `repository`, `versions` record with `deprecated`, `dependencies`, `hasInstallScript`, `scripts`, `_npmUser`, `dist`, `readme`, `types`/`typings`)
+  - `GithubRepoData` — shape returned by the GitHub repo endpoint (relevant fields: `archived`, `pushed_at`, `open_issues_count`, `stargazers_count`, `license`, `default_branch`)
+  - `GithubContributorStat` — shape from `/stats/contributors`
+  - `GithubCommitActivity` — shape from `/stats/commit_activity`
+  - `OsvVulnerability` — shape from OSV query response
+  - `NpmDownloads` — shape from npm download-counts API
+  - `FetchResult` — the aggregated raw data bag passed from the fetch layer to the scoring engine: `{ packument, downloads, githubRepo, githubContributors, githubCommitActivity, vulnerabilities }` where each field is `T | null` (null = unavailable)
+  - `CategoryWeights` — `Record<CategoryName, number>` with the six weights from the spec
+- [ ] Use `as const satisfies` for the `CATEGORY_WEIGHTS` constant object and the `LICENSE_TIERS` lookup table, co-located in a `src/types/constants.ts` file
+
+### 3. Data-fetching layer — npm registry client
+
+Read: `coding-playbook/architecture/patterns`, `coding-playbook/services/error-handling`
+
+- [ ] Create `src/fetch/index.ts` as the orchestrator: it takes `{ packageName: string, githubToken?: string }` and returns `Promise<FetchResult>`. It fetches the packument first (sequential — needed for repo URL and version), then fans out all other fetches in parallel using `Promise.allSettled`. Each settled result maps to `T | null` in `FetchResult`. The orchestrator has step-by-step inline comments narrating the pipeline
+- [ ] Create `src/fetch/fetchPackument/index.ts` — fetches `https://registry.npmjs.org/<encodedName>` (handle scoped package URL encoding), returns typed `NpmPackument`. Throws on 404 (package not found) — this is the only hard failure. Throws on network error
+- [ ] Create `src/fetch/fetchDownloads/index.ts` — fetches last-week and last-month download counts from the npm API (`https://api.npmjs.org/downloads/point/last-week/<name>` and `last-month`), returns `NpmDownloads`
+- [ ] Create `src/fetch/extractRepoUrl/index.ts` — pure function that extracts a GitHub owner/repo pair from the packument's `repository` field (handles `github:user/repo`, full HTTPS URLs, git+ssh URLs, shorthand). Returns `{ owner, repo, directory?: string } | null`
+
+### 4. Data-fetching layer — GitHub and OSV clients
+
+Read: `coding-playbook/architecture/patterns`, `coding-playbook/services/error-handling`
+
+- [ ] Create `src/fetch/fetchGithubRepo/index.ts` — fetches `https://api.github.com/repos/:owner/:repo`, injects `Authorization: Bearer <token>` header when `githubToken` is present, returns typed `GithubRepoData | null`. Returns `null` on 403 (rate limited) or 404. Handles the 202 retry pattern for stats endpoints
+- [ ] Create `src/fetch/fetchGithubContributors/index.ts` — fetches `/repos/:owner/:repo/stats/contributors`, handles 202 retry (up to 3 attempts with 1s delay), returns `GithubContributorStat[] | null`
+- [ ] Create `src/fetch/fetchGithubCommitActivity/index.ts` — fetches `/repos/:owner/:repo/stats/commit_activity`, handles 202 retry, returns `GithubCommitActivity[] | null`
+- [ ] Create `src/fetch/fetchVulnerabilities/index.ts` — POSTs to `https://api.osv.dev/v1/query` with `{ package: { name, ecosystem: "npm" }, version }` for the target package, returns `OsvVulnerability[]`. Also supports batch queries via `https://api.osv.dev/v1/querybatch` for dependency CVE checking
+- [ ] Create `src/fetch/fetchDeprecatedDeps/index.ts` — takes the direct dependency list from the packument, fetches each dependency's packument in parallel (using `Promise.allSettled`), returns a list of `{ name: string, deprecated: string }` for any that have a `deprecated` field on their latest version
+
+### 5. Scoring engine — category scorers with handler array dispatch
+
+Read: `coding-playbook/architecture/patterns`, `coding-playbook/workflow/type-system`, `coding-playbook/foundations/conventions`
+
+- [ ] Create `src/score/index.ts` as the scoring orchestrator: takes `FetchResult` and returns `PackageHealth`. Uses the handler array dispatch pattern — imports all six category scorers, iterates them in sequence, each returns a `CategoryScore | null` (null if required data is unavailable). After all handlers run, computes the weighted aggregate using only non-null categories (re-normalizing weights to available signals). Computes `confidence` as the percentage of total weight backed by data. Collects warnings from all scorers. Inline comments narrate each step
+- [ ] Create `src/score/scoreMaintenance/index.ts` — scores publish recency (decay curve from spec), bus factor (from GitHub contributor stats), deprecation status, archived status, and the "finished project" exception. Input: `FetchResult`. Returns `CategoryScore` with detail strings
+- [ ] Create `src/score/scoreSecurity/index.ts` — scores current-version CVEs weighted by severity (CRITICAL=0 override, HIGH/MODERATE/LOW penalties), plus dependency CVE exposure from the batch OSV query. Input: `FetchResult`
+- [ ] Create `src/score/scoreSupplyChain/index.ts` — scores install script presence (escalated if new in current version), maintainer changes between recent versions, publish frequency anomalies, provenance/Sigstore attestation. Input: `FetchResult`
+- [ ] Create `src/score/scoreLicense/index.ts` — maps license to five-tier SPDX risk model using the `LICENSE_TIERS` lookup, normalizes non-standard strings, handles compound SPDX expressions (OR = least restrictive, AND = most restrictive), flags npm/GitHub license mismatch. Input: `FetchResult`
+- [ ] Create `src/score/scoreCommunity/index.ts` — scores download trend (last-week vs last-month ratio), GitHub stars, contributor diversity. Trend weighted more heavily than raw count. Input: `FetchResult`
+- [ ] Create `src/score/scoreQuality/index.ts` — scores README presence and length, TypeScript type declarations (bundled or `@types/`), test script presence, GitHub community health percentage. Input: `FetchResult`
+
+### 6. Terminal renderer — format PackageHealth into the spec's output format
+
+Read: `coding-playbook/foundations/conventions`, `coding-playbook/architecture/data-flow`
+
+- [ ] Create `src/render/index.ts` as the render orchestrator: takes `PackageHealth` and returns a `string` (the complete terminal output). No side effects — it returns the string, the CLI entry point prints it. The orchestrator imports helpers for each section of the output
+- [ ] Create `src/render/renderHeader/index.ts` — formats `pkg-pulse: <name>@<version>` and the overall score line with confidence percentage
+- [ ] Create `src/render/renderCategories/index.ts` — formats each category as a bar chart row (`renderBar` helper) with score, label, and detail strings. Uses Unicode block characters for the bar
+- [ ] Create `src/render/renderWarnings/index.ts` — formats the warnings section with severity icons
+- [ ] Create `src/render/renderFooter/index.ts` — formats data sources list, unavailable signals section, and the confidence advisory message when coverage is below 100%
+
+### 7. CLI entry point — argument parsing, validation, orchestration
+
+Read: `coding-playbook/foundations/conventions`, `coding-playbook/services/error-handling`, `coding-playbook/services/service-layer`
+
+- [ ] Create `src/bin/index.ts`: the top-level orchestrator. Reads `process.argv` for the package name (no framework — simple positional arg parsing). Reads `GITHUB_TOKEN` from `process.env`. Validates the package name against npm naming rules (no special characters except `@` and `/` for scoped packages). Calls the fetch orchestrator, then the scoring engine, then the renderer, then prints to stdout. Sets exit codes per spec: 0 success, 1 not found, 2 total network failure, 3 invalid name
+- [ ] Create `src/bin/validatePackageName/index.ts` — pure function that validates npm package name format. Returns `{ valid: true, name: string }` or `{ valid: false, reason: string }`
+- [ ] Add a shebang `#!/usr/bin/env node` to the bin entry and ensure `package.json` bin field points to `./dist/bin/index.js`
+
+### 8. Unit tests — scoring engine
+
+Read: `coding-playbook/workflow/testing`, `coding-playbook/foundations/conventions`
+
+- [ ] Create `src/score/index.test.ts` — test the scoring orchestrator: weighted aggregate computation, re-normalization when categories are null, confidence calculation, warning aggregation. Use factory functions for `FetchResult` and `CategoryScore`
+- [ ] Create `src/score/scoreMaintenance/index.test.ts` — test publish recency decay curve at each threshold boundary, bus factor scoring, deprecation override (score = 0), archived override (score = 0), "finished project" exception (maintenance floor of 90)
+- [ ] Create `src/score/scoreSecurity/index.test.ts` — test CRITICAL CVE override (score = 0), severity weighting, clean package (score = 100), dependency CVE penalties
+- [ ] Create `src/score/scoreSupplyChain/index.test.ts` — test install script detection, new-install-script escalation, maintainer change detection, provenance signal
+- [ ] Create `src/score/scoreLicense/index.test.ts` — test each license tier (MIT=100, LGPL=70, GPL=40, AGPL=20, UNLICENSED=0), non-standard string normalization, compound SPDX expressions
+- [ ] Create `src/score/scoreCommunity/index.test.ts` — test download trend computation (growth vs decline), raw count capping, zero-downloads edge case
+- [ ] Create `src/score/scoreQuality/index.test.ts` — test README scoring, TypeScript type detection, test script presence
+
+### 9. Unit tests — fetch layer and CLI
+
+Read: `coding-playbook/workflow/testing`, `coding-playbook/services/error-handling`
+
+- [ ] Create `src/fetch/fetchPackument/index.test.ts` — test successful fetch, 404 throws, scoped package URL encoding
+- [ ] Create `src/fetch/extractRepoUrl/index.test.ts` — test GitHub URL extraction from various repository field formats (HTTPS, git+ssh, shorthand, GitLab returns null, missing field returns null)
+- [ ] Create `src/fetch/fetchVulnerabilities/index.test.ts` — test OSV response parsing, empty results, network error returns null
+- [ ] Create `src/bin/validatePackageName/index.test.ts` — test valid names, scoped names, invalid characters, empty string
+- [ ] Create `src/render/index.test.ts` — test that render output contains expected sections (header, categories, warnings, footer) for a fully-populated `PackageHealth` and for a degraded one with unavailable signals
+
+### 10. Integration wiring and build verification
+
+Read: `coding-playbook/workflow/feature-checklist`, `coding-playbook/foundations/conventions`
+
+- [ ] Wire `src/bin/index.ts` to import and call the fetch orchestrator, scoring engine, and renderer in sequence. Ensure error handling at the top level catches packument 404 (exit 1), total network failure (exit 2), and invalid name (exit 3). Emit a warning to stderr when `GITHUB_TOKEN` is absent
+- [ ] Add `build` script to `package.json`: `tsc` (compiles to `./dist`). Verify `npx pkg-pulse react` runs end-to-end after build. Add a `dev` script that uses `tsx` for development: `tsx src/bin/index.ts`
+- [ ] Verify the three spec example scenarios produce reasonable output: a healthy package (e.g., `zod`), a deprecated package (e.g., `request`), and a package with partial coverage (no GitHub token)
+
+## Decisions
+
+**No runtime dependencies for HTTP.** Node 22 ships native `fetch`. Adding `node-fetch` or `undici` explicitly would be unnecessary weight for a CLI tool that makes simple GET/POST requests. The only dependency consideration is TypeScript and Vitest as dev deps.
+
+**Three-layer architecture: bin -> fetch + score -> render.** The CLI entry point (`bin`) orchestrates the pipeline. The fetch layer and scoring engine are independent — fetch produces raw data, score consumes it. The renderer is a pure function from `PackageHealth` to string. This separation means the scoring engine can be tested with synthetic `FetchResult` objects without any network calls, and the renderer can be tested with synthetic `PackageHealth` objects without any scoring logic.
+
+**Handler array dispatch for scoring categories.** Each of the six categories is an independent scorer function in its own folder, dispatched by the orchestrator in a loop. Adding or removing a category requires one import and one array entry — no switch statement, no class hierarchy. This directly addresses the spec's undesired outcome about hardcoded scoring formulas.
+
+**`FetchResult` fields are `T | null`, not optional.** A field being `null` means "we tried and couldn't get this data" which is semantically different from `undefined` (never tried). This distinction drives the confidence indicator and unavailable-signal reporting. Every fetch helper returns its type or `null` — never throws on degraded availability (only `fetchPackument` throws on 404 since that's a hard failure).
+
+**No config abstraction.** `GITHUB_TOKEN` is read directly from `process.env` per the playbook's config convention. No `.env` file shipping with the package — users set the env var themselves.
+
+**`as const satisfies` for weight and license-tier tables.** The `CATEGORY_WEIGHTS` and `LICENSE_TIERS` constants use `as const satisfies Record<...>` to get both narrow literal types and exhaustiveness checking. TypeScript will error if a new category is added to the union but not to the weights table.
+
+**Render returns string, does not write to stdout.** The renderer is a pure function that returns the formatted string. The CLI entry point handles the `process.stdout.write`. This makes the renderer fully testable without mocking stdout.
+
+**Exit codes follow the spec exactly.** 0 = success, 1 = not found (packument 404), 2 = total network failure (packument fetch fails for non-404 reasons), 3 = invalid package name. Partial signal failure within a successful run still exits 0 with degraded confidence.
+
+**Scoped to direct dependencies only.** Per the spec, dependency health analysis checks only direct runtime dependencies from the latest version's `dependencies` object. No transitive walking. This keeps API call count bounded and scoring fast.
+
+**Monorepo detection flagged but not skipped.** If the packument's `repository.directory` field is present, a warning is added noting that GitHub metrics represent the monorepo, not this package specifically. GitHub signals are still used — they provide useful context even when not package-specific.
