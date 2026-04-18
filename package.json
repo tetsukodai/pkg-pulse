@@ -1,0 +1,25 @@
+{
+  "name": "pkg-pulse",
+  "version": "0.1.0",
+  "type": "module",
+  "description": "CLI tool that scores npm package health across six weighted categories",
+  "bin": {
+    "pkg-pulse": "./dist/bin/index.js"
+  },
+  "engines": {
+    "node": ">=22"
+  },
+  "scripts": {
+    "build": "tsc && tsc-alias",
+    "dev": "tsx src/bin/index.ts",
+    "test:unit": "vitest run",
+    "lint": "tsc --noEmit"
+  },
+  "devDependencies": {
+    "@types/node": "^22.0.0",
+    "tsc-alias": "^1.8.16",
+    "tsx": "^4.21.0",
+    "typescript": "^5.7.0",
+    "vitest": "^3.0.0"
+  }
+}

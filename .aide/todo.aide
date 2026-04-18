@@ -1,0 +1,65 @@
+---
+description: >
+  QA re-validation after 3 fixes (provenance field, GitHub warning, score floor cap).
+  All 3 prior issues resolved. One new issue found: the deprecated/archived early-return
+  paths in scoreMaintenance show the version tag string (e.g. "2.88.2") in the
+  "Last publish:" detail line instead of a human-readable elapsed-days value.
+intent: >
+  outcomes.desired[0] — the report must reflect what an experienced engineer would check;
+  outcomes.desired[1] — report covers maintenance cadence (publish recency is a maintenance signal)
+misalignment:
+  - implementation-drift
+  - test-gap
+---
+
+# QA Re-alignment Document — Round 2
+
+## Prior issues (all resolved)
+
+- [x] **src/score/scoreSupplyChain/index.ts** — `hasProvenance()` now correctly checks
+  `dist.attestations` (Sigstore). Verified live: `zod` shows "Sigstore provenance present",
+  `request` shows "No provenance attestation". Regression test added.
+
+- [x] **src/bin/index.ts** — GitHub-absent warning now says "limited to 60 requests/hour"
+  and no longer claims signals will be unavailable. Verified live: unauthenticated run
+  still shows GitHub stars and "GitHub API" in data sources line.
+
+- [x] **src/score/index.ts** — Composite override caps implemented:
+  maintenance=0 AND security=0 → cap 15; security=0 → cap 25; maintenance=0 → cap 35.
+  Verified live: `request` scores exactly 35 (capped) with warning message emitted.
+
+## Issues
+
+- [x] **src/score/scoreMaintenance/index.ts:116 and :131** — The deprecated and archived
+  early-return branches both emit `Last publish: ${latestTag}` in their `details` array,
+  where `latestTag` is the version string (e.g. `"2.88.2"`). The healthy path correctly
+  computes `daysSincePublish` and shows `"Last publish: 2,342 days ago"`, but the early
+  returns exit before that computation, substituting the raw version tag instead. Observed
+  live: `node dist/bin/index.js request` outputs `Last publish: 2.88.2` in the Maintenance
+  row. This gives the user no recency information — exactly the kind of maintenance signal
+  the spec says must be surfaced in the report.
+  `Traces to:` outcomes.desired[0] (report must reflect what an experienced engineer
+  checks — publish recency is the first thing they look at); outcomes.desired[1] (report
+  must cover "maintenance cadence" and "publish recency" explicitly named in the spec)
+  `Misalignment:` implementation-drift (both early-return paths compute the date is available
+  via `packument.time[latestTag]` but never use it); test-gap (deprecated and archived tests
+  assert score=0 and warning text but never assert details content, so the malformed
+  detail string was not caught)
+
+## Retro
+
+**What would have caught this earlier:**
+The deprecated and archived test cases in `scoreMaintenance/index.test.ts` assert
+`output.score === 0` and a critical warning, but neither asserts the `details` array.
+A detail-content assertion — `expect(output.details.some(d => /days ago/.test(d))).toBe(true)`
+— would have caught the version-tag substitution immediately. The render integration
+test in `src/render/index.test.ts` uses fixture data with pre-set detail strings, so
+it also misses this. Adding a snapshot or pattern test on the details array for the
+deprecated scenario would close this gap permanently.
+
+**Stage that should have caught it:**
+The early-return structure was written correctly for score and warnings but the detail
+string was copy-pasted from the archived branch template before `daysSincePublish` was
+computed in scope. A code-review or plan checkpoint that explicitly required verifying
+the detail output of override branches would have caught this at plan-gap or
+implementation-drift stage before QA.
